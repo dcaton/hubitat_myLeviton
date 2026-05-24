@@ -1,0 +1,390 @@
+/*
+
+Copyright 2020 - tomw
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+-------------------------------------------
+
+Change history:
+
+1.4.0 - mingaldrichgan - added My Leviton Fan driver for DW4SF
+1.3.0 - dsegall - added support for detecting when a switch disconnects from MyLeviton
+1.2.1 - dsegall - bugfix for canSetLevel issue
+1.2.0 - tomw + dsegall - Update device statuses from websocket events.  No more polling.
+1.1.0 - dsegall - Added fadeTo feature and custom command.  Added support for duration parameter on setLevel command.
+1.0.0 - tomw - Initial release
+
+ */
+
+metadata
+{
+    definition(name: "My Leviton Fan", namespace: "tomw", author: "tomw", importUrl: "")
+    {
+        capability "Refresh"
+        capability "SignalStrength"
+        capability "Switch"
+        capability "SwitchLevel"
+        capability "FanControl"
+        
+        attribute "commStatus", "string"
+        attribute "connected", "enum", ["true", "false"]
+        attribute "fadeOnTime", "number"
+        attribute "fadeOffTime", "number"
+        attribute "canSetLevel", "boolean"
+        
+        command "fadeTo", [[name: "Level", type: "NUMBER"], [name: "In seconds", type: "NUMBER"]]
+    }
+}
+
+preferences
+{
+    section
+    {
+        input name: "switch_id", type: "text", title: "Switch ID", required: true
+        input name: "suppressDupReq", type: "bool", title: "Attempt to suppress duplicate update requests?", defaultValue: false
+        input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: true
+    }
+}
+
+def logDebug(msg) 
+{
+    if (logEnable)
+    {
+        log.debug(msg)
+    }
+}
+
+def refresh()
+{
+    requestRefresh()
+}    
+
+def on()
+{
+    lev_update_switch('ON')
+}
+
+def off()
+{
+    lev_update_switch('OFF')
+}
+
+// Credit: https://github.com/ernie/hubitat/blob/main/drivers/leviton-zw4sf.groovy#L141-L166
+def setSpeed(speed)
+{
+  logDebug "setSpeed: ${speed}"
+
+  switch (speed) {
+    case ["low", "medium-low"]:
+      setLevel(25)
+      break
+    case "medium":
+      setLevel(50)
+      break
+    case "medium-high":
+      setLevel(75)
+      break
+    case "high":
+      setLevel(100)
+      break
+    case ["on", "auto"]:
+      return on()
+    case "off":
+      return off()
+    default:
+      logDebug "Invalid speed: ${speed}"
+  }
+}
+
+def setLevel(level)
+{
+    setLevel(level, 0)
+}
+
+def setLevel(level, duration)
+{
+    fadeTo(level, duration)
+}
+
+def fadeTo(level, duration) {
+    if (device.currentValue("canSetLevel")?.toBoolean()) {
+        def currFadeOnTime = device.currentValue("fadeOnTime").toInteger()
+        def currFadeOffTime = device.currentValue("fadeOffTime").toInteger()
+    
+        def state = (level == 0 ? 'OFF' : 'ON')
+    
+        try {
+            httpExecWithAuthCheck("PUT", genParamsMain("IotSwitches/${switch_id}", [fadeOnTime: duration * 10, fadeOffTime: duration * 10]), true, "fadeStart", [state: state, level: level, currFadeOnTime: currFadeOnTime, currFadeOffTime: currFadeOffTime, duration: duration])
+        }
+        catch (Exception e) {
+            logDebug("fadeTo failed: ${e.message}")
+            sendEvent(name: "commStatus", value: "error")
+        }
+    }
+}
+
+def fadeStart(response, data) {
+    logDebug("fadeStart with status = ${response.getStatus()} from data = ${data}")
+
+    if(!response.hasError())
+    {
+        updateAttributes(switch_id, response.getJson(), false)
+        
+        try {
+            httpExecWithAuthCheck("PUT", genParamsMain("IotSwitches/${switch_id}", data.level == 0 ? [power: data.state] : [power: data.state, brightness: data.level]), true, "fadeDone", data)
+        }
+        catch (Exception e) {
+            logDebug("fadeTo failed: ${e.message}")
+           sendEvent(name: "commStatus", value: "error")
+        }
+    } 
+}
+
+def fadeDone(response, data) {
+    logDebug("fadeDone with status = ${response.getStatus()} from data = ${data}")
+
+    if(!response.hasError())
+    {
+        updateAttributes(switch_id, response.getJson(), false)
+        def seconds = data.duration.toInteger() * 2
+        logDebug("Scheduling restoreFadeTime for ${seconds}s with data=${data}")
+        runIn(seconds, "restoreFadeTime", [data: data])
+    }
+}
+
+def restoreFadeTime(data) {
+    try {
+        logDebug("restoreFadeTime with data=${data}")
+        httpExecWithAuthCheck("PUT", genParamsMain("IotSwitches/${switch_id}", [fadeOnTime: data.currFadeOnTime, fadeOffTime: data.currFadeOffTime]), true)
+    }
+    catch (Exception e) {
+        logDebug("fadeTo failed: ${e.message}")
+        sendEvent(name: "commStatus", value: "error")
+    }
+}
+
+def lev_update_switch(power, brightness = null)
+{
+    try
+    {
+        // only adjust if current values are different than requested values, or if driver option is disabled
+        if((!suppressDupReq || null == suppressDupReq) || (power == 'ON' ? "on" : "off") != (device.currentValue("switch")) || (brightness != device.currentValue("level")) )
+        {
+            httpExecWithAuthCheck("PUT", genParamsMain("IotSwitches/${switch_id}", !brightness ? [power: power] : [power: power, brightness: brightness]), true) 
+            sendEvent(name: "commStatus", value: "good")
+        }
+    }
+    catch (Exception e)
+    {
+        logDebug("lev_update_switch failed: ${e.message}")
+        sendEvent(name: "commStatus", value: "error")
+    }
+    
+    return
+}
+
+def updateAttributes(id, switchData, fromWebsocket = true, fullRefresh = false)
+{
+    if (fromWebsocket) {
+        def enabled = device.getDataValue("websocketProcessing")
+        if (enabled != null && !enabled.toBoolean())
+            return
+    }
+    
+    if(id.toString() != switch_id)
+    {
+        device.updateSetting("switch_id", id.toString())
+    }
+    
+    def power = switchData.power
+    def brightness = switchData.brightness
+    def rssi = switchData.rssi
+    def fadeOnTime = switchData.fadeOnTime
+    def fadeOffTime = switchData.fadeOffTime
+    def canSetLevel = switchData.canSetLevel == null ? null : switchData.canSetLevel.toBoolean()
+    String connected = switchData.connected
+    
+    //  physical updates always have a single message, with updates to power and/or brightness and chgReason == 1
+    //  digital updates have two messages -- first one with power and/or brightness but no chgReason and then one with chgReason == 3
+    //    ...so, if we're going to update either power or brightness, we only need to check whether chgReason == 1 to know which type
+    //    ...and when we don't know whether a change was physical or digital based on this logic, 
+    //       we just assume physical (presumably adjusted outside of Hubitat)
+    
+    def isPhysical = fullRefresh ? true : (null != switchData.chgReason) ? (1 == switchData.chgReason) : false
+    if(null != power) { sendEvent(name: "switch", value: (power == 'ON') ? "on" : "off", type: (isPhysical ? "physical" : "digital")) }    
+    if(null != brightness) { sendEvent(name: "level", value: brightness, type: (isPhysical ? "physical" : "digital")) }
+    
+    if(null != rssi) { sendEvent(name: "rssi", value: rssi.toInteger()) }
+    if(null != canSetLevel) { sendEvent(name: "canSetLevel", value: canSetLevel) }
+    
+    if (null != fadeOnTime) {
+        sendEvent(name: "fadeOnTime", value: fadeOnTime.toInteger())
+    }
+    else if (canSetLevel) {
+        sendEvent(name: "fadeOnTime", value: 0)
+    }
+    
+    if (null != fadeOffTime) {
+        sendEvent(name: "fadeOffTime", value: fadeOffTime.toInteger())
+    }
+    else if (canSetLevel) {
+        sendEvent(name: "fadeOffTime", value: 0)
+    }
+    
+    sendEvent(name: "connected", value: connected)
+}
+
+def requestRefresh()
+{
+    parent.refreshFromChild()
+}
+
+def checkCommStatus()
+{
+    switch(device.currentValue("commStatus"))
+    {
+        case "good":
+            logDebug("checkCommStatus() success")
+            return true
+        
+        case "error":
+        case "unknown":
+        default:
+            logDebug("checkCommStatus() failed")
+            return false
+    }
+}
+
+def getBaseURI()
+{
+    return "https://my.leviton.com/api/"
+}
+
+def genParamsMain(suffix, body = null)
+{
+    def params =
+        [
+            uri: getBaseURI() + suffix,
+            headers:
+            [
+                'Authorization': parent.getAuth()
+            ],
+            contentType: 'application/json',
+        ]
+    
+    if(body)
+    {
+        params['body'] = body
+    }
+ 
+    return params
+}
+
+def httpPutExec(params, throwToCaller = false, callback = "httpAsyncCallback", callbackData = null)
+{
+    logDebug("httpPutExec(${params})")
+    
+    try
+    {
+        asynchttpPut(callback, params, callbackData)
+    }
+    catch (Exception e)
+    {
+        logDebug("httpPutExec() failed: ${e.message}")
+        if(throwToCaller)
+        {
+            throw(e)
+        }
+    }
+}
+
+def httpAsyncCallback(response, data)
+{
+    logDebug("httpAsyncCallback with status = ${response.getStatus()} from data = ${data}")
+    
+    try {
+        if(!response.hasError())
+        {
+            def respData = response.getJson()
+        
+            logDebug("respData = ${respData}")
+            updateAttributes(switch_id, respData, false)
+        }  
+    }
+    finally {
+        device.removeDataValue("websocketProcessing")
+    }
+}
+
+def httpExec(operation, params, throwToCaller = false, callback = "httpAsyncCallback", callbackData = null)
+{
+    def res
+    
+    switch(operation)
+    {
+        default:
+            logDebug("unsupported Http operation")
+            break
+        
+        case "PUT":
+            res = httpPutExec(params, throwToCaller, callback, callbackData)
+            break        
+    }
+    
+    return res
+}
+
+def httpExecWithAuthCheck(operation, params, throwToCaller = false, callback = "httpAsyncCallback", callbackData = null)
+{
+    def res
+    try
+    {
+        res = httpExec(operation, params, true, callback, callbackData)                
+        return res
+    }
+    catch (Exception e)
+    {
+        if(e.getResponse().getStatus().toInteger() == 401)
+        {
+            // 401 Unauthorized
+            try
+            {
+                logDebug("httpExecWithAuthCheck() auth failed.  retrying...")
+                
+                parent.refreshTokens()                
+                
+                // update with new Auth token
+                params['headers']['Authorization'] = parent.getAuth()
+                
+                res = httpExec(operation, params, true)
+                return res
+            }
+            catch (Exception e2)
+            {
+                logDebug("httpExecWithAuthCheck() failed: ${e2.message}")
+                if(throwToCaller)
+                {
+                    throw(e2)
+                }
+            }
+        }
+        else
+        {
+            if(throwToCaller)
+            {
+                throw(e)
+            }
+        }
+    }
+}
